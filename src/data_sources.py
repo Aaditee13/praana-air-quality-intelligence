@@ -163,7 +163,12 @@ def fetch_osm_landuse(lat: float, lon: float, radius_m: int = 3000
     out center 20;
     """
     try:
-        resp = requests.post(OVERPASS_BASE, data={"data": query}, timeout=REQUEST_TIMEOUT + 10)
+        resp = requests.post(
+            OVERPASS_BASE,
+            data={"data": query},
+            headers={"User-Agent": "PRAANA-AQI-Intelligence/1.0 (hackathon research project)"},
+            timeout=REQUEST_TIMEOUT + 10,
+        )
         resp.raise_for_status()
         data = resp.json()
     except requests.exceptions.RequestException as e:
