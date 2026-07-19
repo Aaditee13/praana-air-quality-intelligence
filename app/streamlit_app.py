@@ -14,6 +14,7 @@ need no key. "Demo data" mode works with no setup at all.
 import base64
 import os
 import sys
+from datetime import datetime
 
 import pandas as pd
 import plotly.express as px
@@ -23,7 +24,7 @@ import streamlit as st
 # allow `import src.xxx` whether this is run from repo root or app/ folder
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src import advisory, aqi, data_sources as ds, demo_data, enforcement, fingerprint, forecast, multicity
+from src import advisory, aqi, data_sources as ds, demo_data, enforcement, fingerprint, forecast, forecast_model, multicity
 
 try:
     from dotenv import load_dotenv
@@ -327,6 +328,13 @@ def load_osm(lat, lon, radius_m, live: bool):
     return ds.fetch_osm_landuse(lat, lon, radius_m=min(radius_m * 1000, 5000))
 
 
+# Real per-horizon GBR models (Section 13 RMSE 80.8/82.5/83.8), trained once
+# and cached for the whole app's lifetime rather than retrained per request.
+@st.cache_resource(show_spinner="Training validated per-horizon forecast models (one-time)...")
+def get_trained_forecast_models():
+    return forecast_model.train_all_horizon_models()
+
+
 with st.spinner("Pulling live data..." if is_live else "Loading demo data..."):
     readings,  readings_err = load_readings(coords["lat"], coords["lon"], radius_km * 1000, is_live)
     weather,   weather_err  = load_weather(coords["lat"], coords["lon"], is_live)
@@ -350,11 +358,34 @@ if using_fallback:
 # ---------------------------------------------------------------------------
 clean_readings  = {k: v for k, v in readings.items() if not str(k).startswith("_")}
 aqi_result      = aqi.compute_aqi(clean_readings)
-attribution     = fingerprint.attribute_sources(clean_readings)
+attribution     = fingerprint.attribute_sources_with_wind(
+    clean_readings,
+    sensor_lat=coords["lat"],
+    sensor_lon=coords["lon"],
+    wind_from_deg=weather[0]["wind_direction_deg"] if weather else 270,
+    nearby_sites=osm_sites,
+)
 forecast_points = forecast.forecast_aqi(aqi_result["aqi"] or 150, weather, horizon_hours=72)
 baseline_points = forecast.persistence_baseline(aqi_result["aqi"] or 150, horizon_hours=72)
+
+# Anchor the 24h/48h/72h checkpoints to the real trained per-horizon GBR
+# models (the ones RMSE-validated in Section 13) instead of leaving the
+# whole curve as only the lighter wind/rain heuristic. The heuristic still
+# supplies the smooth hourly shape between checkpoints; the three marked
+# checkpoints are genuine model output.
+trained_forecast_models = get_trained_forecast_models()
+weather_by_offset = {i: w for i, w in enumerate(weather)}
+validated_checkpoints = forecast_model.predict_live(
+    trained_forecast_models, aqi_result["aqi"] or 150, datetime.now(), weather_by_offset
+)
+for h in (24, 48, 72):
+    idx = h - 1
+    if idx < len(forecast_points):
+        forecast_points[idx]["predicted_aqi"] = validated_checkpoints[h]
+        forecast_points[idx]["validated"] = True
+
 action_list     = enforcement.build_action_list(attribution, aqi_result, osm_sites)
-tomorrow_aqi    = forecast_points[23]["predicted_aqi"] if len(forecast_points) > 23 else aqi_result["aqi"]
+tomorrow_aqi    = validated_checkpoints[24]
 advisory_out    = advisory.generate_advisory(ward_label or city, aqi_result["aqi"] or 150, tomorrow_aqi, language)
 
 # ---------------------------------------------------------------------------
@@ -461,6 +492,15 @@ with tab2:
                               line=dict(color="#E8862E", width=3), name="Predicted AQI"))
     fig.add_trace(go.Scatter(x=df["hour_offset"], y=df["persistence_baseline"], mode="lines",
                               line=dict(color="#7FA8BC", width=2, dash="dash"), name="Persistence baseline"))
+    # Mark the three model-validated checkpoints (24h/48h/72h) distinctly
+    # from the heuristic-interpolated curve around them.
+    checkpoint_df = df[df.get("validated", False) == True] if "validated" in df.columns else df.iloc[0:0]
+    if not checkpoint_df.empty:
+        fig.add_trace(go.Scatter(
+            x=checkpoint_df["hour_offset"], y=checkpoint_df["predicted_aqi"], mode="markers",
+            marker=dict(symbol="diamond", size=11, color="#FFFFFF", line=dict(color="#E8862E", width=2)),
+            name="Validated model checkpoint (24h/48h/72h)",
+        ))
     # FIX: transparent background + white axis labels
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
@@ -474,9 +514,12 @@ with tab2:
     )
     st.plotly_chart(fig, use_container_width=True)
     st.caption(
-        "Heuristic forecast: persistence baseline adjusted for wind, rain, and a rush-hour / "
-        "still-night diurnal pattern from live Open-Meteo data. Production design uses a GNN "
-        "blended with atmospheric dispersion modelling."
+        "Diamond markers at 24h/48h/72h are real output from the independently trained, "
+        "RMSE-validated per-horizon GBR models (Section 13: 80.8 / 82.5 / 83.8 vs persistence). "
+        "The connecting hourly curve between checkpoints uses a lighter wind/rain/diurnal "
+        "heuristic for smooth display, since the trained models only predict at those three "
+        "discrete horizons. Production design uses a GNN blended with atmospheric dispersion "
+        "modelling across all 72 hours."
     )
 
 # ── Agent 3 ──────────────────────────────────────────────────────────────
