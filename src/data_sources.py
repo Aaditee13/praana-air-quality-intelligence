@@ -23,10 +23,16 @@ import requests
 
 OPENAQ_BASE = "https://api.openaq.org/v3"
 OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
+OVERPASS_BASE = "https://overpass-api.de/api/interpreter"
+
+# Public Overpass mirrors, tried in order if the primary times out or errors.
+# overpass-api.de is the most commonly used free endpoint but is also the
+# most frequently overloaded; falling through to alternates before giving
+# up on live data reduces how often the app falls back to demo OSM sites.
 OVERPASS_MIRRORS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
-    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
 ]
 
 REQUEST_TIMEOUT = 15  # seconds
@@ -41,6 +47,51 @@ CITIES = {
 }
 
 OPENAQ_PARAMETERS = ["pm25", "pm10", "no2", "so2", "co", "o3"]
+
+# aqi.py's CPCB breakpoint tables expect these units per pollutant.
+# PM2.5/PM10/NO2/SO2/O3 in micrograms/m3, CO in milligrams/m3.
+# This matters because OpenAQ sensors report CO in whatever unit that
+# station's instrument uses (commonly ug/m3 or ppm), and silently feeding
+# a ug/m3 CO reading into a mg/m3 table clamps the sub-index to 500
+# ("Severe") for almost any real reading -- not a genuine severe-AQI
+# result, just a units mismatch.
+EXPECTED_UNITS = {
+    "pm25": "µg/m³", "pm10": "µg/m³", "no2": "µg/m³", "so2": "µg/m³", "o3": "µg/m³",
+    "co": "mg/m³",
+}
+
+
+def _normalize_pollutant_units(param: str, value: float, reported_units: Optional[str]) -> float:
+    """
+    Converts a raw OpenAQ sensor value into the unit aqi.py expects for that
+    pollutant. If OpenAQ doesn't report units for this sensor, assumes the
+    value is already in the expected unit (OpenAQ's default for most
+    stations) rather than guessing.
+    """
+    if not reported_units:
+        return value
+    units = reported_units.strip().lower()
+
+    if param == "co":
+        if units in ("mg/m3", "mg/m³"):
+            return value
+        if units in ("µg/m3", "ug/m3", "µg/m³", "ug/m³"):
+            return value / 1000.0  # ug/m3 -> mg/m3
+        if units == "ppm":
+            return value * 1.145  # ppm -> mg/m3 at standard temp/pressure (CO molar mass 28.01)
+        return value
+
+    # pm25/pm10/no2/so2/o3 all expect ug/m3
+    if units in ("µg/m3", "ug/m3", "µg/m³", "ug/m³"):
+        return value
+    if units in ("mg/m3", "mg/m³"):
+        return value * 1000.0  # mg/m3 -> ug/m3
+    if units == "ppb" and param in ("no2", "so2", "o3"):
+        # rough ppb -> ug/m3 conversion at standard conditions, molar-mass dependent;
+        # good enough to avoid a gross unit-scale error, not lab-precise.
+        molar_mass = {"no2": 46.0, "so2": 64.0, "o3": 48.0}[param]
+        return value * molar_mass / 24.45
+    return value
 
 
 def get_openaq_api_key() -> Optional[str]:
@@ -135,13 +186,21 @@ def fetch_latest_readings(lat: float, lon: float, radius_m: int = 25000
         return None, f"OpenAQ /latest request failed: {e}"
 
     readings = {}
-    sensors_by_id = {s["id"]: s.get("parameter", {}).get("name") for s in station.get("sensors", [])}
+    sensors_by_id = {
+        s["id"]: {
+            "param": s.get("parameter", {}).get("name"),
+            "units": (s.get("parameter", {}).get("units") or "").lower(),
+        }
+        for s in station.get("sensors", [])
+    }
     for item in data.get("results", []):
         sensor_id = item.get("sensorsId") or item.get("sensorId")
-        param = sensors_by_id.get(sensor_id)
+        info = sensors_by_id.get(sensor_id, {})
+        param = info.get("param")
+        units = info.get("units")
         value = item.get("value")
         if param in OPENAQ_PARAMETERS and value is not None:
-            readings[param] = value
+            readings[param] = _normalize_pollutant_units(param, value, units)
 
     if not readings:
         return None, f"Station '{station.get('name')}' returned no usable pollutant readings right now."
@@ -166,35 +225,27 @@ def fetch_osm_landuse(lat: float, lon: float, radius_m: int = 3000
     );
     out center 20;
     """
-    headers = {"User-Agent": "PRAANA-AQI-Intelligence/1.0 (hackathon research project)"}
-    resp = None
-    last_err = "All Overpass mirrors failed"
-    for mirror in OVERPASS_MIRRORS:
+    last_error = None
+    for mirror_url in OVERPASS_MIRRORS:
         try:
-            resp = requests.post(mirror, data={"data": query},
-                                 headers=headers, timeout=12)
+            resp = requests.post(
+                mirror_url,
+                data={"data": query},
+                headers={"User-Agent": "PRAANA-AQI-Intelligence/1.0 (hackathon research project)"},
+                timeout=REQUEST_TIMEOUT + 10,
+            )
             resp.raise_for_status()
-            break  # success — stop trying mirrors
-        except requests.exceptions.Timeout:
-            last_err = f"Overpass timeout on {mirror}"
-            continue
+            data = resp.json()
+            break  # success — stop trying further mirrors
         except requests.exceptions.RequestException as e:
-            last_err = f"Overpass request failed ({mirror}): {e}"
+            last_error = f"Overpass request to {mirror_url} failed: {e}"
             continue
-
-    if resp is None:
-        return None, last_err
-
-    try:
-        data = resp.json()
-    except ValueError as e:
-        return None, f"Overpass returned invalid JSON: {e}"
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.RequestException as e:
-        return None, f"Overpass request failed: {e}"
-    except ValueError as e:
-        return None, f"Overpass returned invalid JSON: {e}"
+        except ValueError as e:
+            last_error = f"Overpass ({mirror_url}) returned invalid JSON: {e}"
+            continue
+    else:
+        # every mirror in OVERPASS_MIRRORS failed
+        return None, last_error or "All Overpass mirrors failed."
 
     sites = []
     for el in data.get("elements", []):

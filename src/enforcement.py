@@ -62,7 +62,22 @@ def build_action_list(attribution: Dict, aqi_result: Dict, osm_sites: List[Dict]
         if source not in SOURCE_TO_ACTION or share < 5:
             continue
         meta = SOURCE_TO_ACTION[source]
-        matching_sites = [s for s in osm_sites if s.get("category") == source][:3]
+        # Dedupe by name: OSM often splits one real road/site into several
+        # way-segments that share the same name (e.g. a road cut at every
+        # intersection), which previously produced 2-3 near-identical
+        # "duplicate" actions for what is really one physical location.
+        matching_sites = []
+        seen_names = set()
+        for s in osm_sites:
+            if s.get("category") != source:
+                continue
+            name = s.get("name", "unnamed site")
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            matching_sites.append(s)
+            if len(matching_sites) >= 3:
+                break
         impact = estimate_impact(share, aqi_result.get("aqi") or 0)
 
         if matching_sites:

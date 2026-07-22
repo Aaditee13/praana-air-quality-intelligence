@@ -1,6 +1,4 @@
 """
-streamlit_app.py
------------------
 PRAANA dashboard — the working prototype tying all five agents together.
 
 Run with:
@@ -12,6 +10,7 @@ For live data, set OPENAQ_API_KEY in a .env file at the project root
 need no key. "Demo data" mode works with no setup at all.
 """
 import base64
+import math
 import os
 import sys
 from datetime import datetime
@@ -373,16 +372,51 @@ baseline_points = forecast.persistence_baseline(aqi_result["aqi"] or 150, horizo
 # whole curve as only the lighter wind/rain heuristic. The heuristic still
 # supplies the smooth hourly shape between checkpoints; the three marked
 # checkpoints are genuine model output.
+# Anchor the 24h/48h/72h checkpoints to the real trained per-horizon GBR
+# models (the ones RMSE-validated in Section 13) instead of leaving the
+# whole curve as only the lighter wind/rain heuristic. The heuristic still
+# supplies the general hourly shape between checkpoints; the three marked
+# checkpoints are genuine model output.
+#
+# The heuristic and the trained model can disagree substantially (the
+# heuristic is anchored to *today's* current AQI and decays slowly; the
+# model looks at real seasonal/calendar patterns and can predict a very
+# different value days out). Swapping in a single raw point at exactly
+# hour 24/48/72 previously created a sharp, unrealistic cliff-and-recovery
+# spike in the chart. Instead, blend the checkpoint into a window of
+# neighbouring hours so the curve moves toward it smoothly.
+CHECKPOINT_TAPER_HOURS = 8  # hours either side of each checkpoint to blend across
+
 trained_forecast_models = get_trained_forecast_models()
 weather_by_offset = {i: w for i, w in enumerate(weather)}
 validated_checkpoints = forecast_model.predict_live(
     trained_forecast_models, aqi_result["aqi"] or 150, datetime.now(), weather_by_offset
 )
-for h in (24, 48, 72):
+
+n_points = len(forecast_points)
+for h, target_val in validated_checkpoints.items():
     idx = h - 1
-    if idx < len(forecast_points):
-        forecast_points[idx]["predicted_aqi"] = validated_checkpoints[h]
-        forecast_points[idx]["validated"] = True
+    if idx >= n_points:
+        continue
+    lo = max(0, idx - CHECKPOINT_TAPER_HOURS)
+    hi = min(n_points - 1, idx + CHECKPOINT_TAPER_HOURS)
+    for i in range(lo, hi + 1):
+        dist = abs(i - idx)
+        # cosine taper: weight = 1.0 exactly at the checkpoint, smoothly
+        # fading to 0.0 at the edges of the window (no sharp corners)
+        weight = 0.5 * (1 + math.cos(math.pi * dist / (CHECKPOINT_TAPER_HOURS + 1)))
+        point = forecast_points[i]
+        original_pred = point["predicted_aqi"]
+        original_lower = point["lower"]
+        original_upper = point["upper"]
+        blended_pred = weight * target_val + (1 - weight) * original_pred
+        # keep the confidence band's relative width, but re-center it on
+        # the blended value so lower/upper never end up outside the band
+        band_frac = (original_upper - original_lower) / (2 * original_pred) if original_pred else 0.1
+        point["predicted_aqi"] = round(blended_pred, 1)
+        point["lower"] = round(blended_pred * (1 - band_frac))
+        point["upper"] = round(blended_pred * (1 + band_frac))
+    forecast_points[idx]["validated"] = True
 
 action_list     = enforcement.build_action_list(attribution, aqi_result, osm_sites)
 tomorrow_aqi    = validated_checkpoints[24]
@@ -392,9 +426,23 @@ advisory_out    = advisory.generate_advisory(ward_label or city, aqi_result["aqi
 # Header
 # ---------------------------------------------------------------------------
 st.title("PRAANA — Urban Air Quality Intelligence")
+
+# Explicit, unambiguous data-mode status -- computed fresh every rerun from
+# the actual booleans, not a single combined flag that can go stale.
+# Previously "live but one source (e.g. OSM) fell back" and "fully demo"
+# both collapsed into the same "demo / fallback" label, which made fully
+# real live data look fake.
+if not is_live:
+    data_mode_label = "demo"
+elif not using_fallback:
+    data_mode_label = "live"
+else:
+    fallback_names = ", ".join(msg.split(" (")[0] for msg in using_fallback)
+    data_mode_label = f"live (partial fallback: {fallback_names})"
+
 st.caption(
     f"{city} · station: {readings.get('_station_name', 'n/a')} · "
-    f"data mode: {'live' if is_live and not using_fallback else 'demo / fallback'}"
+    f"data mode: {data_mode_label}"
 )
 
 col1, col2, col3, col4 = st.columns(4)

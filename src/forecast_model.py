@@ -30,6 +30,7 @@ Run: python3 src/forecast_model.py
 """
 
 import sys, os
+from sklearn.ensemble import HistGradientBoostingRegressor
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import math
@@ -105,10 +106,7 @@ def train_and_evaluate_horizon(df: pd.DataFrame, horizon: int):
     X_train, y_train = train[FEATURE_COLS], train[f"target_{horizon}h"]
     X_test, y_test = test[FEATURE_COLS], test[f"target_{horizon}h"]
 
-    model = GradientBoostingRegressor(
-        n_estimators=200, max_depth=5, learning_rate=0.08,
-        subsample=0.8, random_state=42, verbose=0,
-    )
+    model = HistGradientBoostingRegressor(max_iter=200, max_depth=5, learning_rate=0.08, random_state=42)
     model.fit(X_train, y_train)
 
     preds = model.predict(X_test)
@@ -139,7 +137,9 @@ def run_evaluation():
     print("=" * 66)
 
     df_raw = pd.read_parquet(DATA_PATH)
+    print(f"Loaded {len(df_raw)} rows, building features...")
     df = build_features(df_raw)
+    print("Features built, training 3 models (this can take a minute)...")
 
     results = {}
     models = {}
