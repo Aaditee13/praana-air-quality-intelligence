@@ -23,7 +23,11 @@ import requests
 
 OPENAQ_BASE = "https://api.openaq.org/v3"
 OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
-OVERPASS_BASE = "https://overpass-api.de/api/interpreter"
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+]
 
 REQUEST_TIMEOUT = 15  # seconds
 
@@ -162,13 +166,29 @@ def fetch_osm_landuse(lat: float, lon: float, radius_m: int = 3000
     );
     out center 20;
     """
+    headers = {"User-Agent": "PRAANA-AQI-Intelligence/1.0 (hackathon research project)"}
+    resp = None
+    last_err = "All Overpass mirrors failed"
+    for mirror in OVERPASS_MIRRORS:
+        try:
+            resp = requests.post(mirror, data={"data": query},
+                                 headers=headers, timeout=12)
+            resp.raise_for_status()
+            break  # success — stop trying mirrors
+        except requests.exceptions.Timeout:
+            last_err = f"Overpass timeout on {mirror}"
+            continue
+        except requests.exceptions.RequestException as e:
+            last_err = f"Overpass request failed ({mirror}): {e}"
+            continue
+
+    if resp is None:
+        return None, last_err
+
     try:
-        resp = requests.post(
-            OVERPASS_BASE,
-            data={"data": query},
-            headers={"User-Agent": "PRAANA-AQI-Intelligence/1.0 (hackathon research project)"},
-            timeout=REQUEST_TIMEOUT + 10,
-        )
+        data = resp.json()
+    except ValueError as e:
+        return None, f"Overpass returned invalid JSON: {e}"
         resp.raise_for_status()
         data = resp.json()
     except requests.exceptions.RequestException as e:
